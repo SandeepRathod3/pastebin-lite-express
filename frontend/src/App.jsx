@@ -8,6 +8,12 @@ function App() {
       <Routes>
         <Route path="/" element={<HomePage />} />
         <Route path="/p/:id" element={<ViewPastePage />} />
+                <Route path="*" element={
+          <div className="p-8 text-center">
+            <h1 className="text-2xl font-bold mb-4">Route not found</h1>
+            <p>Current path: {window.location.pathname}</p>
+          </div>
+  } />
       </Routes>
     </div>
   );
