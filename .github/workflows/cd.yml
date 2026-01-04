@@ -1,0 +1,255 @@
+name: Continuous Deployment
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - '.github/workflows/cd.yml'
+
+# Allow manual deployment
+workflow_dispatch:
+  inputs:
+    environment:
+      description: 'Environment to deploy to'
+      required: true
+      default: 'production'
+      type: choice
+      options:
+        - staging
+        - production
+    skip-tests:
+      description: 'Skip tests'
+      required: false
+      default: false
+      type: boolean
+
+jobs:
+  # Deploy Backend
+  deploy-backend:
+    name: Deploy Backend to Vercel
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'production' }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install Vercel CLI
+      run: npm install -g vercel@latest
+
+    - name: Pull Vercel Environment
+      env:
+        VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+        VERCEL_PROJECT_ID: ${{ secrets.VERCEL_BACKEND_PROJECT_ID }}
+      working-directory: ./backend
+      run: |
+        vercel pull --yes --environment=production --token=$VERCEL_TOKEN
+
+    - name: Deploy Backend
+      env:
+        VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+        VERCEL_PROJECT_ID: ${{ secrets.VERCEL_BACKEND_PROJECT_ID }}
+      working-directory: ./backend
+      run: |
+        # Deploy to Vercel
+        DEPLOY_OUTPUT=$(vercel --prod --token=$VERCEL_TOKEN --yes 2>&1)
+        echo "$DEPLOY_OUTPUT"
+        
+        # Extract deployment URL
+        if [[ $DEPLOY_OUTPUT =~ (https://[^\s]+) ]]; then
+          DEPLOYMENT_URL="${BASH_REMATCH[1]}"
+          echo "DEPLOYMENT_URL=$DEPLOYMENT_URL" >> $GITHUB_ENV
+          echo "BACKEND_URL=$DEPLOYMENT_URL" >> $GITHUB_ENV
+        fi
+
+    - name: Update Deployment Status
+      uses: bobheadxi/deployments@v1
+      with:
+        step: start
+        token: ${{ secrets.GITHUB_TOKEN }}
+        env: ${{ github.event.inputs.environment || 'production' }}
+        desc: "Backend deployment to Vercel"
+
+    - name: Store Backend URL
+      run: |
+        echo "Backend deployed to: ${{ env.BACKEND_URL }}"
+        echo "BACKEND_URL=${{ env.BACKEND_URL }}" >> $GITHUB_STATE
+
+    - name: Trigger Database Migration
+      if: success()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.actions.createWorkflowDispatch({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            workflow_id: 'database.yml',
+            ref: context.ref,
+            inputs: {
+              environment: '${{ github.event.inputs.environment || "production" }}'
+            }
+          });
+
+  # Deploy Frontend
+  deploy-frontend:
+    name: Deploy Frontend to Vercel
+    runs-on: ubuntu-latest
+    needs: deploy-backend
+    environment: ${{ github.event.inputs.environment || 'production' }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install Vercel CLI
+      run: npm install -g vercel@latest
+
+    - name: Pull Vercel Environment
+      env:
+        VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+        VERCEL_PROJECT_ID: ${{ secrets.VERCEL_FRONTEND_PROJECT_ID }}
+      working-directory: ./frontend
+      run: |
+        vercel pull --yes --environment=production --token=$VERCEL_TOKEN
+
+    - name: Update Frontend Environment Variables
+      env:
+        BACKEND_URL: ${{ needs.deploy-backend.outputs.backend-url }}
+      working-directory: ./frontend
+      run: |
+        # Create .env.production with backend URL
+        echo "VITE_API_URL=${{ env.BACKEND_URL }}/api" > .env.production
+        echo "Updated environment variables"
+
+    - name: Build Frontend
+      working-directory: ./frontend
+      run: npm run build
+
+    - name: Deploy Frontend
+      env:
+        VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+        VERCEL_PROJECT_ID: ${{ secrets.VERCEL_FRONTEND_PROJECT_ID }}
+      working-directory: ./frontend
+      run: |
+        # Deploy with prebuilt assets
+        DEPLOYMENT_URL=$(vercel deploy --prebuilt --prod --token=$VERCEL_TOKEN)
+        echo "DEPLOYMENT_URL=$DEPLOYMENT_URL" >> $GITHUB_ENV
+        echo "Frontend deployed to: $DEPLOYMENT_URL"
+
+    - name: Update Deployment Status
+      uses: bobheadxi/deployments@v1
+      with:
+        step: finish
+        token: ${{ secrets.GITHUB_TOKEN }}
+        env: ${{ github.event.inputs.environment || 'production' }}
+        desc: "Frontend deployment to Vercel"
+        deployment_id: ${{ env.GITHUB_RUN_ID }}
+
+    - name: Comment on Commit (for main branch)
+      if: github.ref == 'refs/heads/main'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const backendUrl = '${{ needs.deploy-backend.outputs.backend-url }}';
+          const frontendUrl = '${{ env.DEPLOYMENT_URL }}';
+          
+          github.rest.repos.createCommitComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            commit_sha: context.sha,
+            body: `🚀 **Deployment Successful!**
+            
+            **Frontend:** ${frontendUrl}
+            **Backend API:** ${backendUrl}
+            
+            **Health Check:** ${backendUrl}/api/healthz
+            **Create Paste:** ${frontendUrl}
+            
+            Deployed by GitHub Actions at ${new Date().toISOString()}`
+          });
+
+  # Post-Deployment Verification
+  verify-deployment:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: [deploy-backend, deploy-frontend]
+    environment: ${{ github.event.inputs.environment || 'production' }}
+    
+    steps:
+    - name: Check Backend Health
+      env:
+        BACKEND_URL: ${{ needs.deploy-backend.outputs.backend-url }}
+      run: |
+        echo "Checking backend health at: $BACKEND_URL/api/healthz"
+        
+        # Retry logic
+        for i in {1..10}; do
+          if curl -f -s "$BACKEND_URL/api/healthz" | grep -q '"ok":true'; then
+            echo "✅ Backend is healthy"
+            break
+          fi
+          echo "⏳ Waiting for backend... ($i/10)"
+          sleep 10
+        done
+        
+        # Final check
+        curl -f "$BACKEND_URL/api/healthz" || exit 1
+
+    - name: Test API Endpoints
+      env:
+        BACKEND_URL: ${{ needs.deploy-backend.outputs.backend-url }}
+      run: |
+        # Test paste creation
+        echo "Testing paste creation..."
+        RESPONSE=$(curl -s -X POST "$BACKEND_URL/api/pastes" \
+          -H "Content-Type: application/json" \
+          -d '{"content": "CI/CD Test Paste", "ttl_seconds": 300}')
+        
+        echo "Response: $RESPONSE"
+        
+        # Extract paste ID
+        PASTE_ID=$(echo $RESPONSE | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+        
+        if [ -n "$PASTE_ID" ]; then
+          echo "✅ Paste created successfully with ID: $PASTE_ID"
+          
+          # Test retrieving paste
+          curl -f "$BACKEND_URL/api/pastes/$PASTE_ID" || exit 1
+          echo "✅ Paste retrieval successful"
+        else
+          echo "❌ Failed to create paste"
+          exit 1
+        fi
+
+    - name: Send Deployment Notification
+      if: success()
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_CHANNEL: deployments
+        SLACK_COLOR: good
+        SLACK_TITLE: "🚀 Pastebin-Lite Deployed Successfully"
+        SLACK_MESSAGE: |
+          *Frontend*: ${{ needs.deploy-frontend.outputs.frontend-url }}
+          *Backend*: ${{ needs.deploy-backend.outputs.backend-url }}
+          *Commit*: ${{ github.sha }}
+          *Environment*: ${{ github.event.inputs.environment || 'production' }}
+      with:
+        username: GitHub Actions
+        icon_emoji: ':rocket:'
