@@ -7,18 +7,17 @@ on:
       - 'frontend/**'
       - 'backend/**'
       - '.github/workflows/*.yml'
-
-# Manual trigger
-workflow_dispatch:
-  inputs:
-    environment:
-      description: 'Environment'
-      required: true
-      default: 'production'
-      type: choice
-      options:
-        - production
-        - staging
+  # Manual trigger - fixed indentation
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
 
 jobs:
   deploy-backend:
