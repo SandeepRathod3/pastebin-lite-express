@@ -2,10 +2,6 @@ name: Deploy Backend (Render)
 
 on:
   workflow_call:
-    inputs:
-      environment:
-        required: true
-        type: string
     outputs:
       backend-url:
         description: "Backend URL"
@@ -19,57 +15,9 @@ jobs:
       backend-url: ${{ steps.save-url.outputs.backend-url }}
 
     steps:
-      # -----------------------------
-      # Checkout repo
-      # -----------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
-      # -----------------------------
-      # Fetch Render service info
-      # -----------------------------
-      - name: Get Render Service Info
-        id: render-info
-        run: |
-          echo "🔍 Fetching Render service info..."
-          
-          # Make API request with better error handling
-          RESPONSE=$(curl -s \
-            -w "\n%{http_code}" \
-            -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
-            -H "Accept: application/json" \
-            "https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }}")
-          
-          # Extract HTTP status code and response body
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
-          
-          echo "🔍 HTTP Status Code: $HTTP_CODE"
-          echo "🔍 Raw API response:"
-          echo "$RESPONSE_BODY"
-          
-          # Check if request was successful
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ API request failed with status code: $HTTP_CODE"
-            echo "❌ Response: $RESPONSE_BODY"
-            exit 1
-          fi
-          
-          # Try to parse JSON, handle errors
-          if ! SERVICE_URL=$(echo "$RESPONSE_BODY" | jq -r '.serviceDetails.url'); then
-            echo "❌ Failed to parse JSON response"
-            echo "❌ Response was: $RESPONSE_BODY"
-            exit 1
-          fi
-          
-          if [ "$SERVICE_URL" = "null" ] || [ -z "$SERVICE_URL" ]; then
-            echo "❌ Failed to fetch Render service URL"
-            echo "❌ Response was: $RESPONSE_BODY"
-            exit 1
-          fi
-          
-          echo "service-url=$SERVICE_URL" >> $GITHUB_OUTPUT
-          echo "✅ Backend URL: $SERVICE_URL"
       # -----------------------------
       # Trigger Render deployment
       # -----------------------------
@@ -81,13 +29,13 @@ jobs:
             -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
             "https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }}/deploys"
 
-          echo "✅ Deployment triggered successfully"
+          echo "✅ Deployment triggered"
 
       # -----------------------------
-      # Save backend URL as output
+      # Save backend URL
       # -----------------------------
       - name: Save Backend URL
         id: save-url
         run: |
-          echo "backend-url=${{ steps.render-info.outputs.service-url }}" >> $GITHUB_OUTPUT
-          echo "BACKEND_URL=${{ steps.render-info.outputs.service-url }}" >> $GITHUB_ENV
+          echo "backend-url=${{ secrets.RENDER_BACKEND_URL }}" >> $GITHUB_OUTPUT
+          echo "BACKEND_URL=${{ secrets.RENDER_BACKEND_URL }}" >> $GITHUB_ENV
