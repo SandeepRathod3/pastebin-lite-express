@@ -8,42 +8,67 @@ on:
         type: string
     outputs:
       backend-url:
-        description: 'Backend URL'
+        description: "Backend URL"
         value: ${{ jobs.deploy.outputs.backend-url }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     outputs:
       backend-url: ${{ steps.save-url.outputs.backend-url }}
-    
+
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      # -----------------------------
+      # Checkout repo
+      # -----------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Get Render Service Info
-      id: render-info
-      run: |
-        # Get Render service URL
-        RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
-          "https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }}")
-        
-        SERVICE_URL=$(echo $RESPONSE | jq -r '.service.url')
-        echo "service-url=$SERVICE_URL" >> $GITHUB_OUTPUT
-        
-        echo "✅ Backend URL: $SERVICE_URL"
+      # -----------------------------
+      # Fetch Render service info
+      # -----------------------------
+      - name: Get Render Service Info
+        id: render-info
+        run: |
+          echo "🔍 Fetching Render service info..."
 
-    - name: Deploy to Render
-      run: |
-        echo "Triggering Render deployment..."
-        curl -X POST \
-          -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
-          "https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }}/deploys"
-        
-        echo "✅ Deployment triggered"
+          RESPONSE=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            -H "Accept: application/json" \
+            "https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }}")
 
-    - name: Save Backend URL
-      id: save-url
-      run: |
-        echo "backend-url=${{ steps.render-info.outputs.service-url }}" >> $GITHUB_OUTPUT
-        echo "BACKEND_URL=${{ steps.render-info.outputs.service-url }}" >> $GITHUB_ENV
+          echo "🔍 Raw API response:"
+          echo "$RESPONSE"
+
+          SERVICE_URL=$(echo "$RESPONSE" | jq -r '.serviceDetails.url')
+
+          if [ "$SERVICE_URL" = "null" ] || [ -z "$SERVICE_URL" ]; then
+            echo "❌ Failed to fetch Render service URL"
+            exit 1
+          fi
+
+          echo "service-url=$SERVICE_URL" >> $GITHUB_OUTPUT
+          echo "✅ Backend URL: $SERVICE_URL"
+
+      # -----------------------------
+      # Trigger Render deployment
+      # -----------------------------
+      - name: Deploy to Render
+        run: |
+          echo "🚀 Triggering Render deployment..."
+
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            "https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }}/deploys"
+
+          echo "✅ Deployment triggered successfully"
+
+      # -----------------------------
+      # Save backend URL as output
+      # -----------------------------
+      - name: Save Backend URL
+        id: save-url
+        run: |
+          echo "backend-url=${{ steps.render-info.outputs.service-url }}" >> $GITHUB_OUTPUT
+          echo "BACKEND_URL=${{ steps.render-info.outputs.service-url }}" >> $GITHUB_ENV
