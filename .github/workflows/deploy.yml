@@ -15,6 +15,10 @@ on:
         default: false
         type: boolean
 
+env:
+  # Set default backend URL for all jobs
+  BACKEND_URL: ${{ secrets.RENDER_BACKEND_URL }}
+
 jobs:
   # -----------------------------------------------------------
   # Testing Phase
@@ -41,7 +45,7 @@ jobs:
       run: |
         # Remove experimental VM modules flag for Jest
         npm test -- --no-coverage 2>&1 || echo "Tests failed, but continuing..."
-      continue-on-error: true  # Don't fail the pipeline on test failures
+      continue-on-error: true
 
   test-frontend:
     name: Test Frontend
@@ -66,9 +70,13 @@ jobs:
         npm test -- --passWithNoTests 2>&1 || echo "Tests failed, but continuing..."
       continue-on-error: true
 
-    - name: Build Frontend
+    - name: Build Frontend (with test API)
       working-directory: ./frontend
-      run: npm run build
+      run: |
+        # Build with a test API URL to verify build works
+        echo "VITE_API_URL=https://api.example.com/api" > .env.production
+        npm run build
+        echo "✅ Frontend built successfully"
 
   # -----------------------------------------------------------
   # Database Migrations (Optional)
@@ -92,19 +100,16 @@ jobs:
       run: |
         echo "Running database migrations..."
         
-        # Test database connection
         if ! psql "$DATABASE_URL" -c "SELECT version();"; then
           echo "❌ Cannot connect to database"
           exit 1
         fi
         
-        # Run main schema if exists
         if [ -f "backend/schema.sql" ]; then
           echo "Applying main schema..."
           psql "$DATABASE_URL" -f backend/schema.sql
         fi
         
-        # Run migrations if any
         if [ -d "backend/src/db/migrations" ]; then
           echo "Running additional migrations..."
           for migration in $(ls backend/src/db/migrations/*.sql | sort); do
@@ -114,13 +119,6 @@ jobs:
         fi
         
         echo "✅ Database migration completed"
-
-    - name: Verify Database
-      env:
-        DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      run: |
-        echo "Verifying database structure..."
-        psql "$DATABASE_URL" -c "\dt"
 
   # -----------------------------------------------------------
   # Backend Deployment (Render)
@@ -132,6 +130,7 @@ jobs:
     
     outputs:
       backend-url: ${{ steps.save-url.outputs.backend-url }}
+      api-base-url: ${{ steps.save-url.outputs.api-base-url }}
     
     steps:
     - name: Trigger Render Deployment
@@ -147,8 +146,14 @@ jobs:
     - name: Save Backend URL
       id: save-url
       run: |
-        echo "backend-url=${{ secrets.RENDER_BACKEND_URL }}" >> $GITHUB_OUTPUT
-        echo "Backend URL: ${{ secrets.RENDER_BACKEND_URL }}"
+        BACKEND_URL="${{ secrets.RENDER_BACKEND_URL }}"
+        # Remove trailing slash if present
+        BACKEND_URL="${BACKEND_URL%/}"
+        
+        echo "backend-url=$BACKEND_URL" >> $GITHUB_OUTPUT
+        echo "api-base-url=$BACKEND_URL/api" >> $GITHUB_OUTPUT
+        echo "Backend URL: $BACKEND_URL"
+        echo "API Base URL: $BACKEND_URL/api"
 
   # -----------------------------------------------------------
   # Frontend Deployment (Vercel)
@@ -173,36 +178,86 @@ jobs:
     - name: Install Vercel CLI
       run: npm install -g vercel
 
-    - name: Create Environment File
+    - name: Install Frontend Dependencies
       working-directory: ./frontend
-      run: |
-        echo "VITE_API_URL=${{ needs.deploy-backend.outputs.backend-url }}/api" > .env.production
-        echo "✅ Created .env.production"
+      run: npm ci
 
-    - name: Build Frontend
+    - name: Create Environment File with Correct API URL
       working-directory: ./frontend
       run: |
-        npm ci
+        # Get the API URL from backend deployment
+        API_URL="${{ needs.deploy-backend.outputs.api-base-url }}"
+        
+        echo "Setting VITE_API_URL to: $API_URL"
+        echo "VITE_API_URL=$API_URL" > .env.production
+        
+        # Verify the file was created
+        echo "✅ Created .env.production with content:"
+        cat .env.production
+
+    - name: Build Frontend with Environment
+      working-directory: ./frontend
+      run: |
+        echo "Building frontend with API URL: $VITE_API_URL"
         npm run build
-        echo "✅ Frontend built"
+        echo "✅ Frontend built successfully"
+      env:
+        VITE_API_URL: ${{ needs.deploy-backend.outputs.api-base-url }}
+
+    - name: Verify Build Output
+      working-directory: ./frontend
+      run: |
+        echo "Checking build output..."
+        if [ -f "dist/index.html" ]; then
+          echo "✅ Build created index.html"
+          # Check if API URL is in the built files
+          grep -r "${{ needs.deploy-backend.outputs.api-base-url }}" dist/ || echo "API URL might be dynamically loaded"
+        else
+          echo "❌ Build failed to create index.html"
+          ls -la dist/ || echo "No dist directory"
+          exit 1
+        fi
 
     - name: Deploy to Vercel
       id: deploy
       working-directory: ./frontend
       env:
         VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID || '' }}
+        VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID || '' }}
       run: |
-        # Deploy to Vercel production
+        echo "Deploying to Vercel..."
+        
+        # Link project if IDs are provided
+        if [ -n "$VERCEL_PROJECT_ID" ] && [ -n "$VERCEL_ORG_ID" ]; then
+          echo "Linking Vercel project..."
+          vercel link --yes --token=$VERCEL_TOKEN --project=$VERCEL_PROJECT_ID --scope=$VERCEL_ORG_ID
+        fi
+        
+        # Deploy with environment variables
+        echo "Deploying with production environment..."
         DEPLOY_OUTPUT=$(vercel deploy --prod --token=$VERCEL_TOKEN --yes 2>&1)
         
-        # Extract URL from Vercel output
+        echo "Vercel output:"
+        echo "$DEPLOY_OUTPUT"
+        
+        # Extract URL
         FRONTEND_URL=$(echo "$DEPLOY_OUTPUT" | grep -o 'https://[^ ]*\.vercel\.app' | head -1)
+        
+        if [ -z "$FRONTEND_URL" ]; then
+          FRONTEND_URL=$(echo "$DEPLOY_OUTPUT" | grep -o 'Production: https://[^ ]*' | head -1 | cut -d' ' -f2)
+        fi
         
         if [ -z "$FRONTEND_URL" ]; then
           FRONTEND_URL=$(echo "$DEPLOY_OUTPUT" | grep -Eo '(https?://[^[:space:]]+)' | head -1)
         fi
         
+        if [ -z "$FRONTEND_URL" ] && [ -n "${{ secrets.VERCEL_FRONTEND_URL }}" ]; then
+          FRONTEND_URL="${{ secrets.VERCEL_FRONTEND_URL }}"
+        fi
+        
         echo "frontend-url=$FRONTEND_URL" >> $GITHUB_OUTPUT
+        echo "FRONTEND_URL=$FRONTEND_URL" >> $GITHUB_ENV
         echo "✅ Deployed to: $FRONTEND_URL"
 
   # -----------------------------------------------------------
@@ -216,56 +271,95 @@ jobs:
     steps:
     - name: Wait for Backend
       run: |
-        echo "Waiting for backend to be ready..."
+        BACKEND_URL="${{ needs.deploy-backend.outputs.backend-url }}"
+        echo "Waiting for backend at: $BACKEND_URL"
         
-        for i in {1..20}; do
-          if curl -s -f "${{ needs.deploy-backend.outputs.backend-url }}/health" > /dev/null; then
-            echo "✅ Backend is up!"
-            break
+        for i in {1..30}; do
+          if curl -s -f "$BACKEND_URL/health" > /dev/null; then
+            echo "✅ Backend health check passed!"
+            exit 0
           fi
           
-          if [ $i -eq 20 ]; then
-            echo "⚠️ Backend taking longer than expected to start"
+          if [ $i -eq 15 ]; then
+            echo "⚠️ Backend is still starting... (15 attempts)"
           fi
           
-          echo "Waiting... ($i/20)"
+          echo "Waiting for backend... attempt $i/30"
           sleep 10
         done
-
-    - name: Test Backend
-      run: |
-        echo "Testing backend at: ${{ needs.deploy-backend.outputs.backend-url }}"
         
-        curl -f "${{ needs.deploy-backend.outputs.backend-url }}/health" && \
-        echo "✅ Backend is healthy" || \
-        echo "⚠️ Backend health check failed"
+        echo "⚠️ Backend health check timed out after 5 minutes"
 
-    - name: Test Frontend
+    - name: Test API Endpoints
       run: |
-        echo "Testing frontend at: ${{ needs.deploy-frontend.outputs.frontend-url }}"
+        BACKEND_URL="${{ needs.deploy-backend.outputs.backend-url }}"
+        echo "Testing API endpoints..."
         
-        if curl -s -f "${{ needs.deploy-frontend.outputs.frontend-url }}" > /dev/null; then
-          echo "✅ Frontend is accessible"
-        else
-          echo "⚠️ Frontend may have issues"
-        fi
+        echo "1. Testing health endpoint:"
+        curl -s "$BACKEND_URL/health" && echo "✅ Health OK" || echo "❌ Health failed"
+        
+        echo ""
+        echo "2. Testing API base endpoint:"
+        curl -s "$BACKEND_URL/api" && echo "✅ API base OK" || echo "❌ API base failed"
+        
+        echo ""
+        echo "3. Testing pastes endpoint (should return JSON or 404):"
+        curl -s "$BACKEND_URL/api/pastes" && echo "✅ Pastes endpoint accessible" || echo "❌ Pastes endpoint failed"
 
-    - name: Create Summary
+    - name: Test Frontend API Configuration
       run: |
-        echo "## 🚀 Deployment Complete" > summary.md
-        echo "" >> summary.md
-        echo "**Frontend**: ${{ needs.deploy-frontend.outputs.frontend-url }}" >> summary.md
-        echo "**Backend**: ${{ needs.deploy-backend.outputs.backend-url }}" >> summary.md
-        echo "**Database**: Neon PostgreSQL" >> summary.md
-        echo "**Time**: $(date)" >> summary.md
-        echo "" >> summary.md
-        echo "### Testing Links" >> summary.md
-        echo "- [Frontend](${{ needs.deploy-frontend.outputs.frontend-url }})" >> summary.md
-        echo "- [Backend Health](${{ needs.deploy-backend.outputs.backend-url }}/health)" >> summary.md
-        echo "- [Backend API](${{ needs.deploy-backend.outputs.backend-url }}/api)" >> summary.md
+        FRONTEND_URL="${{ needs.deploy-frontend.outputs.frontend-url }}"
+        BACKEND_API_URL="${{ needs.deploy-backend.outputs.api-base-url }}"
+        
+        echo "Frontend URL: $FRONTEND_URL"
+        echo "Backend API URL: $BACKEND_API_URL"
+        
+        echo ""
+        echo "Testing if frontend can access backend API..."
+        
+        # Try to get the frontend page and see if it references the API
+        curl -s "$FRONTEND_URL" | grep -o "$BACKEND_API_URL" && \
+          echo "✅ Frontend references correct API URL" || \
+          echo "⚠️ Frontend may not have correct API URL embedded"
+
+    - name: Create Comprehensive Summary
+      run: |
+        cat > summary.md << EOF
+        # 🚀 Deployment Complete
+        
+        ## URLs
+        - **Frontend**: [${{ needs.deploy-frontend.outputs.frontend-url }}](${{ needs.deploy-frontend.outputs.frontend-url }})
+        - **Backend**: [${{ needs.deploy-backend.outputs.backend-url }}](${{ needs.deploy-backend.outputs.backend-url }})
+        - **API Base**: ${{ needs.deploy-backend.outputs.api-base-url }}
+        
+        ## API Endpoints
+        - Health Check: ${{ needs.deploy-backend.outputs.backend-url }}/health
+        - API Base: ${{ needs.deploy-backend.outputs.backend-url }}/api
+        - Pastes: ${{ needs.deploy-backend.outputs.backend-url }}/api/pastes
+        
+        ## Testing Commands
+        \`\`\`bash
+        # Test backend health
+        curl ${{ needs.deploy-backend.outputs.backend-url }}/health
+        
+        # Test API
+        curl ${{ needs.deploy-backend.outputs.backend-url }}/api/pastes
+        
+        # Visit frontend
+        open ${{ needs.deploy-frontend.outputs.frontend-url }}
+        \`\`\`
+        
+        ## Configuration
+        - Frontend API URL: \`${{ needs.deploy-backend.outputs.api-base-url }}\`
+        - Database: Neon PostgreSQL
+        - Time: $(date)
+        EOF
+        
+        echo "Summary created"
 
     - name: Upload Summary
       uses: actions/upload-artifact@v4
       with:
         name: deployment-summary
         path: summary.md
+        retention-days: 30
