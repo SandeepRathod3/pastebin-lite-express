@@ -80,23 +80,33 @@ jobs:
       - name: Fetch Backend URL from Render API
         id: fetch-url
         run: |
-          RESPONSE=$(curl -s \
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
             -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
             https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }})
 
-          echo "Render API response:"
-          echo "$RESPONSE"
+          BODY=$(echo "$RESPONSE" | head -n 1)
+          STATUS=$(echo "$RESPONSE" | tail -n 1)
 
-          BACKEND_URL=$(echo "$RESPONSE" | jq -r '.serviceDetails.url // empty')
+          echo "HTTP Status: $STATUS"
+          echo "Response Body:"
+          echo "$BODY"
+
+          if [ "$STATUS" != "200" ]; then
+            echo "❌ Render API request failed"
+            exit 1
+          fi
+
+          BACKEND_URL=$(echo "$BODY" | jq -r '.serviceDetails.url // empty')
 
           if [ -z "$BACKEND_URL" ]; then
-            echo "❌ Backend URL not found from Render API"
+            echo "❌ Backend URL not found in Render response"
             exit 1
           fi
 
           echo "backend-url=$BACKEND_URL" >> $GITHUB_OUTPUT
           echo "✅ Backend URL: $BACKEND_URL"
 
+  
   # -----------------------------------------------------------
   # Deploy Frontend (Vercel)
   # -----------------------------------------------------------
